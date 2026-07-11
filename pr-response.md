@@ -1,7 +1,10 @@
 # PR Response Doc — CineLog Watchlist Feature
 
 ## AI Usage
-<!-- Fill in at the end — how you used AI tools during this project -->
+
+- **Test authoring:** Asked Claude to mirror `test_collection.py`'s fixture/assertion structure (the `app`/`sample_user`/`sample_film` fixtures, in-memory SQLite setup) into a new `tests/test_watchlist.py`, producing `test_add_to_watchlist_nonexistent_film_raises` and later `test_get_watchlist_returns_newest_first`, following the same patterns as the existing collection tests rather than inventing a new test structure.
+- **Commit hygiene review:** Asked Claude to check whether my commit messages followed the Conventional Commits spec and whether any bundled multiple logical changes into one commit. It flagged that `fix: adding dedupe logic to add_to_watchlist and proper error handling for both exception types in the route` actually conformed to two types — a new `feat` (the dedupe check and its required `AlreadyInWatchlistError` handling) bundled with an unrelated, pre-existing `fix` (the route never caught `FilmNotFoundError`, so it 500'd instead of returning 404, independent of the dedupe work). I had it split that commit into two via an interactive rebase (`edit` + reset + re-commit) rather than leaving the mixed commit in history.
+- **Rebase conflict diagnosis:** After rebasing onto main's UUID-migration commit, I noticed the `WatchlistEntry` model had disappeared from `models.py` with no conflict ever being flagged. Used Claude to diagnose why: git's 3-way rebase merge only raises a conflict when both sides edit overlapping lines, and none of my commits contained any diff touching `models.py` (the class was assumed present from the shared root commit) — so when main's refactor commit rewrote that file and dropped the class, git had nothing to compare against and silently kept main's version. Used Claude to redo the rebase correctly with `git rebase -i`, marking the relevant commit `edit` to stop and manually restore `WatchlistEntry` (with `film_id` migrated to UUID) before continuing.
 
 ## Comment 1 — Rename
 **What I did:** I used VSCode's search to find uses of `save_to_watchlist`. I updated usages and corresponding imports. I also looked for usages of just `save` to ensure I didn't leave anything behind, and in that I identified the documentation using `save`-language which I changed to `add`-langauge.
@@ -54,4 +57,71 @@ The one place I'd flag as a real tradeoff: newest-first means a watchlist a user
 **How I verified no conflict remains:** `git status` shows a clean working tree and no unmerged paths. `git log --oneline --merges origin/main..HEAD` returns nothing, confirming no merge commits were introduced by the rebase (the one merge commit visible in `git log --graph`, `bbe206c`, is main's own preexisting history, not something created by this rebase). Ran the full test suite (`pytest tests/ -v`): all 6 tests pass, confirming the UUID-typed `WatchlistEntry` works correctly end-to-end alongside the collection tests.
 
 ## PR Description
-<!-- Written at the end — feature overview, design decisions, manual testing steps -->
+
+### What this adds
+
+A watchlist feature for CineLog: users can save films they want to watch later, view that list, and the app prevents the same film from being added twice.
+
+- `POST /watchlist/<user_id>/add` — add a film to a user's watchlist. Body: `{ "film_id": "<uuid>" }`. Returns `201` with the created entry, `404` if the film doesn't exist, or `409` if it's already on the user's watchlist.
+- `GET /watchlist/<user_id>` — return all films on a user's watchlist, newest-added first, with `date_added` and `public` attached to each film.
+
+This mirrors the existing collection feature's shape (`services/watchlist_service.py`, `routes/watchlist/watchlist.py`), but a watchlist represents *intent to watch* rather than films already watched, which drove both design decisions below.
+
+### Design decisions
+
+1. **Visibility defaults to public** (`WatchlistEntry.public = True`) — optimizing for social discovery (friends browsing each other's "want to watch" lists) rather than privacy-by-default. Full reasoning and the acknowledged tradeoff (users who'd prefer their watchlist private by default, and don't discover the toggle) are in [Comment 4](#comment-4--default-visibility) above.
+2. **Sort order is newest-added-first** (`WatchlistEntry.date_added.desc()`), not alphabetical — a watchlist is recency-sensitive (the film you just added is the one you're most likely to act on next), and this also matches the existing collection feature's sort behavior. Full reasoning and the acknowledged tradeoff (older, long-intended entries get buried) are in [Comment 5](#comment-5--sort-order) above.
+
+### Manual testing steps
+
+1. Start the app with Flask's CLI (not `python app.py` directly — running the file directly double-imports it and breaks the shared `SQLAlchemy` instance):
+   ```bash
+   FLASK_APP=app flask run --debug
+   ```
+2. The database starts empty, so seed a film and a user via `flask shell`:
+   ```bash
+   FLASK_APP=app flask shell
+   >>> from app import db
+   >>> from models import Film
+   >>> f = Film(title="Test Film", year=2020, genre="Drama")
+   >>> db.session.add(f)
+   >>> db.session.commit()
+   >>> f.id   # copy this UUID for the curl commands below
+   ```
+3. Add the film to a watchlist (use any string as `<user_id>` for manual testing):
+   ```bash
+   curl -X POST http://localhost:5000/watchlist/1/add \
+     -H "Content-Type: application/json" \
+     -d '{"film_id": "<uuid from step 2>"}'
+   ```
+   Expect `201` with the new entry (`id`, `user_id`, `film_id`, `date_added`, `public: true`).
+4. View the watchlist:
+   ```bash
+   curl http://localhost:5000/watchlist/1
+   ```
+   Expect a `200` with a list containing the film, `date_added`, and `public` attached.
+5. Try adding the same film again:
+   ```bash
+   curl -X POST http://localhost:5000/watchlist/1/add \
+     -H "Content-Type: application/json" \
+     -d '{"film_id": "<same uuid>"}'
+   ```
+   Expect `409` with `{"error": "Film '<uuid>' is already in this user's watchlist"}`.
+6. Try adding a nonexistent film:
+   ```bash
+   curl -X POST http://localhost:5000/watchlist/1/add \
+     -H "Content-Type: application/json" \
+     -d '{"film_id": "00000000-0000-0000-0000-000000000000"}'
+   ```
+   Expect `404` with `{"error": "No film found with id '00000000-0000-0000-0000-000000000000'"}`.
+7. Try adding with no `film_id`:
+   ```bash
+   curl -X POST http://localhost:5000/watchlist/1/add \
+     -H "Content-Type: application/json" -d '{}'
+   ```
+   Expect `400` with `{"error": "film_id is required"}`.
+8. To check sort order specifically: repeat steps 2–3 with a second film, then re-run step 4 and confirm the second film (added more recently) appears first in the list.
+9. Automated coverage: `pytest tests/ -v` — 6 tests covering collection and watchlist behavior (dedup, nonexistent-film handling, sort order) should all pass.
+
+## Commit History
+![Commit history](commit-history.png)
